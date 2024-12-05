@@ -24,12 +24,25 @@
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
+import psycopg2
+from qgis.core import QgsVectorLayer
 
 # Initialize Qt resources from file resources.py
 from .resources import *
 # Import the code for the dialog
 from .irrigation_hotspots_dialog import irrigationHotspotsDialog
 import os.path
+from qgis.core import (
+    QgsVectorLayer,
+    QgsProcessingFeatureSourceDefinition,
+    QgsProcessing,
+    QgsProcessingParameterFeatureSource,
+    QgsProcessingParameterNumber,
+    QgsProcessingParameterFeatureSink,
+    QgsProject,
+    QgsProcessingFeedback,
+)
+from qgis import processing
 
 
 class irrigationHotspots:
@@ -180,21 +193,155 @@ class irrigationHotspots:
             self.iface.removeToolBarIcon(action)
 
 
-    def run(self):
-        """Run method that performs all the real work"""
+    def connect_to_database(self):
+        """Establish a connection to the PostGIS database."""
+        try:
+            conn = psycopg2.connect(
+                dbname="irrigation",
+                user="postgres",
+                password="postgres",
+                host="localhost",
+                port="5432"
+            )
+            return conn
+        except Exception as e:
+            self.iface.messageBar().pushCritical("Database Connection Error", str(e))
+            return None
 
-        # Create the dialog with elements (after translation) and keep reference
-        # Only create GUI ONCE in callback, so that it will only load when the plugin is started
-        if self.first_start == True:
+    def fetch_layers(self, conn):
+        """Fetch available PostGIS layers for combo boxes."""
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT f_table_name FROM geometry_columns;")
+            layers = [row[0] for row in cur.fetchall()]
+            cur.close()
+            return layers
+        except Exception as e:
+            self.iface.messageBar().pushCritical("Error Fetching Layers", str(e))
+            return []
+
+    def create_buffer(self, conn, layer_name, distance):
+        """Create a buffer for the specified layer in the database."""
+        try:
+            buffer_table = f"{layer_name}_buffer"
+            query = f"""
+                DROP TABLE IF EXISTS {buffer_table};
+                CREATE TABLE {buffer_table} AS
+                SELECT ST_Buffer(geom, {distance}) AS geom
+                FROM {layer_name};
+            """
+            cur = conn.cursor()
+            cur.execute(query)
+            conn.commit()
+            cur.close()
+            return buffer_table
+        except Exception as e:
+            self.iface.messageBar().pushCritical("Error Creating Buffer", str(e))
+            return None
+
+    def find_irrigation_areas(self, conn, river_buffer, road_buffer, population_layer):
+        """Identify suitable irrigation areas by intersecting buffers and population layer."""
+        try:
+            result_table = "irrigation_areas"
+            common_srid = 4326  # Ensure all geometries are in this SRID
+            query = f"""
+                DROP TABLE IF EXISTS {result_table};
+                CREATE TABLE {result_table} AS
+                SELECT 
+                    ST_Intersection(
+                        ST_Transform(a.geom, {common_srid}),
+                        ST_Transform(b.geom, {common_srid})
+                    ) AS geom
+                FROM {river_buffer} AS a
+                JOIN {road_buffer} AS b
+                ON ST_Intersects(
+                    ST_Transform(a.geom, {common_srid}),
+                    ST_Transform(b.geom, {common_srid})
+                )
+                JOIN {population_layer} AS c
+                ON ST_Intersects(
+                    ST_Transform(a.geom, {common_srid}),
+                    ST_Transform(c.geom, {common_srid})
+                )
+                WHERE c.TotalPopn < 1000;
+            """
+            cur = conn.cursor()
+            cur.execute(query)
+            conn.commit()
+            cur.close()
+            return result_table
+        except Exception as e:
+            self.iface.messageBar().pushCritical("Error Finding Irrigation Areas", str(e))
+            return None
+
+    def load_layer_into_qgis(self, layer_name, layer_alias):
+        """Load a PostGIS table into QGIS as a layer."""
+        uri = f"dbname='irrigation' host='localhost' port='5432' user='postgres' password='postgres' table=\"{layer_name}\" (geom)"
+        layer = QgsVectorLayer(uri, layer_alias, "postgres")
+        if layer.isValid():
+            QgsProject.instance().addMapLayer(layer)
+        else:
+            self.iface.messageBar().pushCritical("Error Loading Layer", f"Layer {layer_alias} could not be loaded.")
+
+    def load_csv_as_layer(self, csv_path, layer_name):
+        """Load a CSV file as a QGIS layer."""
+        uri = f"file://{csv_path}?type=csv&xField=longitude&yField=latitude&crs=EPSG:4326"
+        layer = QgsVectorLayer(uri, layer_name, "delimitedtext")
+        if layer.isValid():
+            QgsProject.instance().addMapLayer(layer)
+            return layer
+        else:
+            self.iface.messageBar().pushCritical("Error Loading CSV", f"Could not load the CSV file {layer_name}.")
+            return None
+
+    def run(self):
+        """Run the plugin logic."""
+        if self.first_start:
             self.first_start = False
             self.dlg = irrigationHotspotsDialog()
 
-        # show the dialog
+        # Establish database connection
+        conn = self.connect_to_database()
+        if not conn:
+            return
+
+        # Fetch available layers and populate combo boxes
+        layers = self.fetch_layers(conn)
+        self.dlg.comboBox.clear()
+        self.dlg.comboBox.addItems(layers)
+        self.dlg.comboBox_2.clear()
+        self.dlg.comboBox_2.addItems(layers)
+        self.dlg.comboBox_3.clear()
+        self.dlg.comboBox_3.addItems(layers)
+
+        # Show the dialog
         self.dlg.show()
-        # Run the dialog event loop
         result = self.dlg.exec_()
-        # See if OK was pressed
+
         if result:
-            # Do something useful here - delete the line containing pass and
-            # substitute with your code.
-            pass
+            # Get user-selected layers and buffer distance
+            river_layer = self.dlg.comboBox.currentText()
+            road_layer = self.dlg.comboBox_2.currentText()
+            population_layer = self.dlg.comboBox_3.currentText()
+
+            if not river_layer or not road_layer or not population_layer:
+                self.iface.messageBar().pushWarning("Selection Error", "Please select all required layers.")
+                return
+
+            # Create buffers for the river and road layers
+            river_buffer = self.create_buffer(conn, river_layer, 100)  # Example: 100m buffer
+            road_buffer = self.create_buffer(conn, road_layer, 50)   # Example: 50m buffer
+
+            if not river_buffer or not road_buffer:
+                return
+
+            # Identify irrigation areas
+            irrigation_areas = self.find_irrigation_areas(conn, river_buffer, road_buffer, population_layer)
+            if not irrigation_areas:
+                return
+
+            # Load the irrigation areas layer into QGIS
+            self.load_layer_into_qgis(irrigation_areas, "Irrigation Areas")
+
+        # Close the database connection
+        conn.close()
